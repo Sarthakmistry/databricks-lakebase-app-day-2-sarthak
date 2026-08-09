@@ -19,6 +19,7 @@ from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from massive_client import MassiveClient
+from weather_client import WeatherClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
@@ -29,12 +30,21 @@ _w = WorkspaceClient()
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
+WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather_documents")
 
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
     t.strip().upper()
     for t in os.environ.get("NEWS_TICKERS", "AAPL,MSFT,GOOGL,AMZN,TSLA").split(",")
     if t.strip()
+]
+
+DEFAULT_WEATHER_LOCATIONS = [
+    loc.strip()
+    for loc in os.environ.get(
+        "WEATHER_LOCATIONS", "Chicago, IL,Austin, TX,Nashville, TN"
+    ).split(",")
+    if loc.strip()
 ]
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
@@ -101,6 +111,36 @@ def ensure_news_table():
         f"CREATE INDEX IF NOT EXISTS idx_{NEWS_TABLE_NAME}_ticker "
         f"ON {NEWS_TABLE_NAME} (ticker)"
     )
+
+    def ensure_weather_table():
+    """
+    Create the raw weather documents table in Lakebase if it doesn't exist
+    yet. This is the RAW document store that Part 2's embedding ingestion
+    script reads from to populate weather_embeddings.
+    """
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WEATHER_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            location TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            headline TEXT,
+            narrative_text TEXT NOT NULL,
+            issued_at TIMESTAMPTZ,
+            payload JSONB NOT NULL,
+            synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_TABLE_NAME}_location "
+        f"ON {WEATHER_TABLE_NAME} (location)"
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_TABLE_NAME}_source_type "
+        f"ON {WEATHER_TABLE_NAME} (source_type)"
+    )
+ 
 
 
 def _current_user_email() -> str:
@@ -203,6 +243,41 @@ def sync_news_from_massive():
 
     return jsonify({"synced": total, "tickers": tickers})
 
+@app.route("/weather/sync", methods=["POST"])
+def sync_weather():
+    """
+    Fetch active alerts + forecast narratives for a set of locations from
+    the NWS API (no key required) and upsert them into weather_documents.
+ 
+    Body (optional JSON): {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}
+    Defaults to DEFAULT_WEATHER_LOCATIONS when no locations are supplied.
+    "limit" caps the number of forecast periods kept per location (alerts
+    are never truncated, since there are usually only a handful active).
+    """
+    ensure_weather_table()
+    client = WeatherClient()
+ 
+    body = request.json if request.is_json else {}
+    locations = body.get("locations") or DEFAULT_WEATHER_LOCATIONS
+    locations = [loc.strip() for loc in locations if isinstance(loc, str) and loc.strip()]
+    limit = int(body.get("limit", 50))
+ 
+    total = 0
+    errors = []
+    for location in locations:
+        try:
+            docs = client.fetch_documents_for_location(location)
+        except Exception as exc:  # noqa: BLE001 - one bad location shouldn't kill the sync
+            logger.exception("Failed to fetch weather for %s", location)
+            errors.append({"location": location, "error": str(exc)})
+            continue
+        docs = docs[:limit]
+        total += _upsert_weather_batch(docs)
+ 
+    result = {"synced": total, "locations": locations}
+    if errors:
+        result["errors"] = errors
+    return jsonify(result)
 
 @app.route("/watchlist", methods=["GET"])
 def get_watchlist():
@@ -403,6 +478,47 @@ def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
                 )
                 count += 1
             conn.commit()
+    return count
+
+
+def _upsert_weather_batch(docs: list[dict]) -> int:
+    """Upsert a batch of normalized weather documents into Lakebase."""
+    import json as _json
+ 
+    count = 0
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for doc in docs:
+                if not doc.get("id"):
+                    continue
+                cur.execute(
+                    f"""
+                    INSERT INTO {WEATHER_TABLE_NAME} (
+                        id, location, source_type, headline,
+                        narrative_text, issued_at, payload, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE
+                    SET location = EXCLUDED.location,
+                        source_type = EXCLUDED.source_type,
+                        headline = EXCLUDED.headline,
+                        narrative_text = EXCLUDED.narrative_text,
+                        issued_at = EXCLUDED.issued_at,
+                        payload = EXCLUDED.payload,
+                        synced_at = EXCLUDED.synced_at
+                    """,
+                    (
+                        doc["id"],
+                        doc["location"],
+                        doc["source_type"],
+                        doc.get("headline"),
+                        doc["narrative_text"],
+                        doc.get("issued_at"),
+                        _json.dumps(doc["payload"]),
+                    ),
+                )
+                count += 1
+        conn.commit()
     return count
 
 
