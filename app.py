@@ -20,6 +20,7 @@ from flask import Flask, jsonify, render_template, request
 import lakebase
 from massive_client import MassiveClient
 from weather_client import WeatherClient
+from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
@@ -31,7 +32,10 @@ TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
 WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather_documents")
-
+WEATHER_EMBEDDINGS_TABLE_NAME = os.environ.get("WEATHER_EMBEDDINGS_TABLE_NAME", "weather_embeddings")
+WEATHER_EMBEDDING_MODEL = os.environ.get(
+    "WEATHER_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
     t.strip().upper()
@@ -52,7 +56,15 @@ DEFAULT_WEATHER_LOCATIONS = [
 # malformed input before we even call the Massive API.
 _TICKER_RE = re.compile(r"^[A-Z]{1,10}(\.[A-Z]{1,2})?$")
 
+_weather_search_model = None
 
+def get_weather_search_model() -> "SentenceTransformer":
+    global _weather_search_model
+    if _weather_search_model is None:
+        logger.info("Loading weather search embedding model: %s", WEATHER_EMBEDDING_MODEL)
+        _weather_search_model = SentenceTransformer(WEATHER_EMBEDDING_MODEL)
+    return _weather_search_model
+    
 def ensure_table():
     """Create the destination table in Lakebase if it doesn't exist yet."""
     lakebase.run_write(
@@ -278,6 +290,68 @@ def sync_weather():
     if errors:
         result["errors"] = errors
     return jsonify(result)
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """
+    Semantic search over ingested weather documents.
+ 
+    Body: {"query": "flash flood risk this weekend", "top_k": 5}
+    Returns the top_k most similar chunks, ranked by cosine similarity.
+    """
+    body = request.json if request.is_json else {}
+ 
+    query = (body.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "Missing or empty 'query'"}), 400
+ 
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        return jsonify({"error": "'top_k' must be an integer"}), 400
+    top_k = max(1, min(top_k, 20))  # clamp per the spec's edge-case handling
+ 
+    model = get_weather_search_model()
+    query_vector = model.encode([query], normalize_embeddings=True)[0].tolist()
+ 
+    # Same array-literal -> vector cast workaround as the ingestion notebook:
+    # binding a Python list straight to a `vector` parameter via psycopg2 isn't
+    # reliable in this environment, so build the literal manually and
+    # double-cast it (double precision[] -> vector) in the query itself.
+    vector_literal = "{" + ",".join(str(float(x)) for x in query_vector) + "}"
+ 
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS count FROM {WEATHER_EMBEDDINGS_TABLE_NAME}")
+            if cur.fetchone()["count"] == 0:
+                return jsonify(
+                    {"results": [], "query": query, "message": "No weather embeddings synced yet."}
+                )
+ 
+            cur.execute(
+                f"""
+                SELECT d.location, d.headline, d.narrative_text, e.chunk_text,
+                       1 - (e.embedding <=> %s::double precision[]::vector) AS similarity
+                FROM {WEATHER_EMBEDDINGS_TABLE_NAME} e
+                JOIN {WEATHER_TABLE_NAME} d ON d.id = e.document_id
+                ORDER BY e.embedding <=> %s::double precision[]::vector
+                LIMIT %s
+                """,
+                (vector_literal, vector_literal, top_k),
+            )
+            rows = cur.fetchall()
+ 
+    results = [
+        {
+            "location": row["location"],
+            "headline": row["headline"],
+            "chunk_text": row["chunk_text"],
+            "similarity": float(row["similarity"]),
+        }
+        for row in rows
+    ]
+    return jsonify({"results": results, "query": query, "top_k": top_k})
+
 
 @app.route("/watchlist", methods=["GET"])
 def get_watchlist():
