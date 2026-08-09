@@ -21,8 +21,13 @@ from typing import Any
 import requests
 
 _BASE_URL = os.environ.get("NWS_API_BASE_URL", "https://api.weather.gov")
+# Open-Meteo's geocoder, not Nominatim: Nominatim's usage policy blocks/deprioritizes
+# traffic from cloud/datacenter IP ranges (AWS, GCP, Azure), which is exactly where a
+# Databricks App's outbound requests come from, so it 403s server-side callers like
+# this one. Open-Meteo is free, keyless, and built for city-name lookups (Nominatim
+# is really meant for full street addresses anyway).
 _GEOCODE_URL = os.environ.get(
-    "GEOCODE_BASE_URL", "https://nominatim.openstreetmap.org/search"
+    "GEOCODE_BASE_URL", "https://geocoding-api.open-meteo.com/v1/search"
 )
 _USER_AGENT = os.environ.get(
     "WEATHER_USER_AGENT",
@@ -32,6 +37,22 @@ _DEFAULT_TIMEOUT = 30
 
 # Matches "41.8781,-87.6298" or "41.8781, -87.6298"
 _LATLON_RE = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
+
+_US_STATE_ABBR_TO_NAME = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
 
 
 class WeatherClient:
@@ -63,23 +84,39 @@ class WeatherClient:
 
     def geocode(self, location: str) -> tuple[float, float]:
         """Resolve a free-text location ('Chicago, IL') to (lat, lon) via the
-        free Nominatim geocoding API (no key required). If `location` is
-        already a 'lat,lon' pair, parses it directly instead of calling out."""
+        free Open-Meteo geocoding API (no key required, no cloud-IP blocking).
+        If `location` is already a 'lat,lon' pair, parses it directly instead
+        of calling out."""
         m = _LATLON_RE.match(location)
         if m:
             return float(m.group(1)), float(m.group(2))
 
+        # "Chicago, IL" -> query on "Chicago", then disambiguate by state
+        # using the admin1 field if multiple matches come back.
+        parts = [p.strip() for p in location.split(",")]
+        name = parts[0]
+        state = parts[1] if len(parts) > 1 else None
+
         resp = self._session.get(
             _GEOCODE_URL,
-            params={"q": location, "format": "json", "limit": 1, "countrycodes": "us"},
+            params={"name": name, "count": 10, "country": "US", "language": "en"},
             headers={"User-Agent": _USER_AGENT},
             timeout=self.timeout,
         )
         resp.raise_for_status()
-        results = resp.json()
+        results = resp.json().get("results") or []
         if not results:
             raise ValueError(f"Could not geocode location: {location!r}")
-        return float(results[0]["lat"]), float(results[0]["lon"])
+
+        if state:
+            target_name = _US_STATE_ABBR_TO_NAME.get(state.upper(), state).lower()
+            for r in results:
+                admin1 = (r.get("admin1") or "").lower()
+                if admin1 == target_name:
+                    return float(r["latitude"]), float(r["longitude"])
+
+        # No state given, or no admin1 match found - fall back to the first result.
+        return float(results[0]["latitude"]), float(results[0]["longitude"])
 
     def get_grid_point(self, lat: float, lon: float) -> dict:
         """GET /points/{lat},{lon} - resolves a lat/lon to the NWS grid office
