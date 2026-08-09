@@ -112,7 +112,7 @@ def ensure_news_table():
         f"ON {NEWS_TABLE_NAME} (ticker)"
     )
 
-    def ensure_weather_table():
+def ensure_weather_table():
     """
     Create the raw weather documents table in Lakebase if it doesn't exist
     yet. This is the RAW document store that Part 2's embedding ingestion
